@@ -57,14 +57,14 @@ Load them in your AI agent to deploy and configure apps without reading document
 
 | Skill | When to use |
 |-------|-------------|
-| [`deploy-homelab-app`](https://github.com/mrsimpson/homelab/tree/main/skills/deploy-homelab-app/SKILL.md) | Add a new app end-to-end (scaffold → RBAC → CI) — lives in the homelab infra repo |
+| [`deploy-homelab-app`](./skills/deploy-homelab-app/SKILL.md) | Add a new app end-to-end (scaffold → RBAC → CI) |
 | [`add-app-with-database`](./skills/add-app-with-database/SKILL.md) | App needs a PostgreSQL database (CNPG) |
 | [`add-app-with-oauth`](./skills/add-app-with-oauth/SKILL.md) | Protect an app with GitHub OAuth (oauth2-proxy) |
 | [`add-app-with-secrets`](./skills/add-app-with-secrets/SKILL.md) | Wire secrets from Pulumi ESC into an app |
 
 ## Adding a new app
 
-Load the `deploy-homelab-app` skill in your AI agent and say *"add a new app to homelab-apps"*.
+Load the [`deploy-homelab-app`](./skills/deploy-homelab-app/SKILL.md) skill in your AI agent and say *"add a new app to homelab-apps"*.
 
 Or manually:
 1. Create `apps/<name>/` following the structure of `apps/lobehub/`
