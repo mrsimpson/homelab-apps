@@ -170,7 +170,7 @@ on the cluster and upload its kubeconfig as a GitHub secret.
 
 ```bash
 APP=<app-name>
-SERVER_OVERRIDE=https://<tailscale-ip>:6443 \
+SERVER=https://<tailscale-ip>:6443 \
   ./scripts/create-kubeconfig.sh $APP
 ```
 
