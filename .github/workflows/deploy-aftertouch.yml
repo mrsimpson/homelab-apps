@@ -1,0 +1,60 @@
+name: Deploy aftertouch
+
+# Deploys the aftertouch Pulumi stack to the homelab k3s cluster.
+#
+# AfterTouch is a local Bose SoundTouch cloud replacement.
+# It is accessible only on the local network (aftertouch.flinker.fritz.box) —
+# no Cloudflare tunnel or public DNS record is created.
+#
+# Uses the reusable workflow from mrsimpson/homelab which handles:
+#   - Tailscale VPN join (to reach the local cluster API)
+#   - kubeconfig setup
+#   - pulumi up / preview
+#
+# Image: ghcr.io/gesellix/bose-soundtouch (pinned in Pulumi.dev.yaml)
+#
+# Pulumi project: "aftertouch" (Pulumi.yaml name: aftertouch)
+# Stack: mrsimpson/aftertouch/dev
+#
+# Required repository secrets:
+#   TS_OAUTH_CLIENT_ID, TS_OAUTH_CLIENT_SECRET  — Tailscale OAuth client (tag:ci)
+#   KUBECONFIG_AFTERTOUCH                        — base64-encoded namespace-scoped kubeconfig
+#   PULUMI_ACCESS_TOKEN                          — Pulumi Cloud access token
+#
+# To provision CI RBAC + kubeconfig:
+#   Run create-kubeconfig.sh aftertouch from the mrsimpson/homelab repository,
+#   then upload the result as the KUBECONFIG_AFTERTOUCH repository secret.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - apps/aftertouch/**
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  deploy:
+    name: Deploy
+    # Pinned to a specific commit SHA (not @main) to prevent unexpected changes
+    # from running with this repo's secrets.
+    # Current SHA corresponds to: feat(scripts): add generate-ci-kubeconfig.sh; document homelab-apps pattern
+    uses: mrsimpson/homelab/.github/workflows/deploy-to-cluster.yml@01381eee8c089d1e860050bf46a4da0258b8732a
+    with:
+      pulumi-stack: mrsimpson/aftertouch/dev
+      working-directory: apps/aftertouch
+      pulumi-command: up
+      # package-lock.json is at the repo root (npm workspaces monorepo, not in apps/aftertouch/)
+      npm-lock-file-path: package-lock.json
+    secrets:
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+      KUBECONFIG: ${{ secrets.KUBECONFIG_AFTERTOUCH }}
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}

@@ -1,0 +1,12 @@
+config:
+  # Image reference — pinned to a specific version from GHCR.
+  aftertouch:image: ghcr.io/gesellix/bose-soundtouch:0.76
+  # Management credentials (set as secrets via: pulumi config set aftertouch:mgmtUsername <val> --secret)
+  aftertouch:mgmtUsername:
+    secure: AAABAKWV2MssF0th7F5LPAgpHMa4lrzP2rgTxLSv59lIiARSXzFQt7+z
+  aftertouch:mgmtPassword:
+    secure: AAABABTKuCDbNhbl6erzbWLVCUsYGzLxknZFJTMGNfrYVC/YYAiSt0cV7DS0O68szy9BoZHpL1AJOrkZlnpmRg==
+  # Optional: comma-separated list of known speaker IPs for faster discovery
+  # aftertouch:preferredDevices: "192.168.1.x,192.168.1.y"
+
+  aftertouch:preferredDevices: 192.168.13.110,192.168.13.71

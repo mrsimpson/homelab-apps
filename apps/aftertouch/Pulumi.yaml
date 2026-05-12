@@ -1,0 +1,21 @@
+name: aftertouch
+description: aftertouch deployment — Bose SoundTouch local cloud replacement on homelab k8s
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+main: src/
+
+config:
+  # All values use the "aftertouch:" namespace prefix (matching pulumi.Config("aftertouch") in src/index.ts).
+  # Set with: pulumi config set aftertouch:<key> <value>
+
+  # Image reference — pinned to a specific version.
+  # Update with: pulumi config set aftertouch:image ghcr.io/gesellix/bose-soundtouch:<version>
+
+  # Required secrets (set with --secret flag):
+  # pulumi config set aftertouch:mgmtUsername  <username>  --secret
+  # pulumi config set aftertouch:mgmtPassword  <password>  --secret
+
+  # Optional: comma-separated list of known speaker IPs
+  # pulumi config set aftertouch:preferredDevices 192.168.x.x,192.168.x.y
