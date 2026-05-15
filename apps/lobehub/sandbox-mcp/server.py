@@ -3,14 +3,24 @@ sandbox-mcp: A minimal MCP server exposing sandboxed code execution tools.
 
 Wraps sandlock (Landlock + seccomp) for per-call process isolation.
 Serves Streamable HTTP MCP at POST /mcp on port 8888 (localhost only).
+
+Important: all tools that call Sandbox.run() are declared async and
+offload the blocking native call to a thread pool via run_in_executor.
+FastMCP calls sync tools directly on the event loop thread, which causes
+sandlock's fork()-based supervisor to fail (sandlock_spawn returns null
+when called from within a running asyncio event loop). Making tools async
+and using run_in_executor matches the pattern in sandlock's own MCP server.
 """
 
+import asyncio
 import logging
 import pathlib
+import tempfile
 from mcp.server.fastmcp import FastMCP
 from sandlock import Sandbox, Policy, landlock_abi_version, LandlockUnavailableError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("sandbox_mcp")
 
 # ---------------------------------------------------------------------------
 # Session workspace base directory (mounted as emptyDir in k8s)
@@ -84,10 +94,14 @@ def _make_policy(ws: pathlib.Path) -> Policy:
     )
 
 
-def _run_sandboxed(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
-    """Execute cmd inside a sandlock sandbox and return combined stdout+stderr."""
-    import logging, sys
-    log = logging.getLogger("sandbox_mcp")
+def _run_sandboxed_sync(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
+    """Execute cmd inside a sandlock sandbox and return combined stdout+stderr.
+
+    This is a blocking function — always call it via run_in_executor from
+    async tool handlers so it runs in a thread, not on the event loop thread.
+    Sandlock's fork()-based supervisor fails when called from within a running
+    asyncio event loop (sandlock_spawn returns null).
+    """
     try:
         policy = _make_policy(ws)
         log.info("spawn: cmd=%s ws=%s", cmd, ws)
@@ -108,16 +122,25 @@ def _run_sandboxed(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
         log.error("LandlockUnavailable: %s", exc)
         return f"[error] Landlock unavailable on this kernel: {exc}"
     except Exception as exc:  # noqa: BLE001
-        log.exception("unexpected error in _run_sandboxed: cmd=%s", cmd)
+        log.exception("unexpected error in _run_sandboxed_sync: cmd=%s", cmd)
         return f"[error] {exc}"
 
 
+async def _run_sandboxed(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
+    """Async wrapper: offloads blocking _run_sandboxed_sync to a thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, _run_sandboxed_sync, cmd, ws, timeout
+    )
+
+
 # ---------------------------------------------------------------------------
-# Tools
+# Tools — all async so FastMCP dispatches them correctly and we can
+# await run_in_executor for the blocking Sandbox.run() call.
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def execute_python(code: str, session_id: str = "default") -> str:
+async def execute_python(code: str, session_id: str = "default") -> str:
     """Execute Python code in a sandboxed environment.
 
     The code runs inside a sandlock sandbox (Landlock + seccomp):
@@ -133,10 +156,9 @@ def execute_python(code: str, session_id: str = "default") -> str:
     Returns:
         Combined stdout and stderr from the execution.
     """
-    import tempfile
     ws = _session_workspace(session_id)
     # Write code to a temp file in the workspace (avoids ARG_MAX limits with
-    # long scripts and the read-only root filesystem; only /tmp/sessions is
+    # long scripts; the root filesystem is read-only — only /tmp/sessions is
     # writable via emptyDir).
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", dir=ws, delete=False, prefix="_exec_"
@@ -144,7 +166,7 @@ def execute_python(code: str, session_id: str = "default") -> str:
         f.write(code)
         script_path = f.name
     try:
-        return _run_sandboxed(["python3", script_path], ws)
+        return await _run_sandboxed(["python3", script_path], ws)
     finally:
         try:
             pathlib.Path(script_path).unlink()
@@ -153,7 +175,7 @@ def execute_python(code: str, session_id: str = "default") -> str:
 
 
 @mcp.tool()
-def run_shell(command: str, session_id: str = "default") -> str:
+async def run_shell(command: str, session_id: str = "default") -> str:
     """Run a shell command in a sandboxed environment.
 
     The command runs via sh -c inside a sandlock sandbox (Landlock + seccomp):
@@ -170,7 +192,7 @@ def run_shell(command: str, session_id: str = "default") -> str:
         Combined stdout and stderr from the execution.
     """
     ws = _session_workspace(session_id)
-    return _run_sandboxed(["sh", "-c", command], ws)
+    return await _run_sandboxed(["sh", "-c", command], ws)
 
 
 @mcp.tool()
@@ -253,7 +275,7 @@ def list_files(path: str = ".", session_id: str = "default") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
