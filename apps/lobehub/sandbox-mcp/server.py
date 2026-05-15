@@ -95,40 +95,85 @@ def _make_policy(ws: pathlib.Path) -> Policy:
 
 
 def _run_sandboxed_sync(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
-    """Execute cmd inside a sandlock sandbox and return combined stdout+stderr.
+    """Execute cmd inside a sandlock sandbox via an isolated helper subprocess.
 
-    This is a blocking function — always call it via run_in_executor from
-    async tool handlers so it runs in a thread, not on the event loop thread.
-    Sandlock's fork()-based supervisor fails when called from within a running
-    asyncio event loop (sandlock_spawn returns null).
+    Sandlock's native fork()-based supervisor fails when called from a
+    multi-threaded Python process (uvicorn). The workaround: spawn a
+    fresh single-threaded Python helper that calls sandlock and returns
+    the result over a pipe. The helper is isolated from the event loop.
     """
-    import ctypes as _ct
-    import threading as _th
+    import json as _json
+    import subprocess as _sp
+    import sys as _sys
+
+    # The helper script: receives policy+cmd as JSON on stdin, runs sandlock,
+    # returns {"ok": bool, "output": str, "error": str|null} as JSON on stdout.
+    helper = r"""
+import sys, json, pathlib
+from sandlock import Sandbox, Policy, LandlockUnavailableError
+
+req = json.loads(sys.stdin.read())
+ws = pathlib.Path(req["ws"])
+cmd = req["cmd"]
+timeout = req["timeout"]
+
+readable = ["/usr", "/lib", "/etc"]
+lib64 = pathlib.Path("/lib64")
+if lib64.exists() and not lib64.is_symlink():
+    readable.append("/lib64")
+
+policy = Policy(
+    fs_readable=readable,
+    fs_writable=[str(ws)],
+    net_allow_hosts=[],
+    max_memory="256M",
+    max_processes=20,
+    clean_env=True,
+    env={"HOME": str(ws), "TMPDIR": str(ws), "PATH": "/usr/local/bin:/usr/bin:/bin"},
+)
+
+try:
+    result = Sandbox(policy).run(cmd, timeout=float(timeout))
+    stdout = result.stdout.decode(errors="replace")
+    stderr = result.stderr.decode(errors="replace")
+    output = stdout
+    if stderr:
+        output = output + ("\n" if output else "") + stderr
+    if not result.success:
+        err = getattr(result, "error", None)
+        prefix = f"[exit {result.exit_code}]"
+        if err:
+            prefix += f" {err}"
+        output = prefix + ("\n" + output if output else "")
+    print(json.dumps({"ok": True, "output": output or "(no output)"}))
+except LandlockUnavailableError as e:
+    print(json.dumps({"ok": False, "output": f"[error] Landlock unavailable: {e}"}))
+except Exception as e:
+    print(json.dumps({"ok": False, "output": f"[error] {e}"}))
+"""
+
+    request = _json.dumps({"cmd": cmd, "ws": str(ws), "timeout": timeout})
+    log.info("spawn (via helper): cmd=%s ws=%s", cmd, ws)
     try:
-        policy = _make_policy(ws)
-        log.info(
-            "spawn: cmd=%s ws=%s tid=%s pid=%s threads=%s",
-            cmd, ws, _th.get_ident(), __import__('os').getpid(),
-            _th.active_count(),
+        proc = _sp.run(
+            [_sys.executable, "-c", helper],
+            input=request,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
         )
-        result = Sandbox(policy).run(cmd, timeout=float(timeout))
-        log.info("done: success=%s exit=%s error=%s", result.success, result.exit_code, getattr(result, "error", None))
-        output = result.stdout.decode(errors="replace")
-        stderr = result.stderr.decode(errors="replace")
-        if stderr:
-            output = output + ("\n" if output else "") + stderr
-        if not result.success:
-            error_detail = getattr(result, "error", None)
-            prefix = f"[exit {result.exit_code}]"
-            if error_detail:
-                prefix += f" {error_detail}"
-            output = prefix + ("\n" + output if output else "")
-        return output or "(no output)"
-    except LandlockUnavailableError as exc:
-        log.error("LandlockUnavailable: %s", exc)
-        return f"[error] Landlock unavailable on this kernel: {exc}"
-    except Exception as exc:  # noqa: BLE001
-        log.exception("unexpected error in _run_sandboxed_sync: cmd=%s", cmd)
+        if proc.returncode != 0 and not proc.stdout.strip():
+            log.error("helper stderr: %s", proc.stderr[:500])
+            return f"[error] helper exited {proc.returncode}: {proc.stderr[:200]}"
+        resp = _json.loads(proc.stdout.strip())
+        result_str = resp.get("output", "(no output)")
+        log.info("done: ok=%s output=%r", resp.get("ok"), result_str[:80])
+        return result_str
+    except _sp.TimeoutExpired:
+        log.error("helper timed out after %ss", timeout + 5)
+        return f"[error] execution timed out after {timeout}s"
+    except Exception as exc:
+        log.exception("helper invocation failed: cmd=%s", cmd)
         return f"[error] {exc}"
 
 
