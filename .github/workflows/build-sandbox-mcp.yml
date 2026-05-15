@@ -1,0 +1,57 @@
+name: Build sandbox-mcp image
+
+# Builds and pushes the sandbox-mcp sidecar image to ghcr.io.
+#
+# The image provides the sandboxed code-execution MCP server that runs as
+# a sidecar alongside LobeHub in the homelab k3s cluster.
+#
+# Image: ghcr.io/<owner>/lobehub-sandbox-mcp:<sha> and :latest
+#
+# After a successful build, update the image tag in the LobeHub Pulumi config:
+#   pulumi config set lobehub:sandboxMcpImage \
+#     ghcr.io/<owner>/lobehub-sandbox-mcp:<sha> --cwd apps/lobehub
+# then commit Pulumi.dev.yaml and let the deploy-lobehub workflow pick it up.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - apps/lobehub/sandbox-mcp/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # required to push to ghcr.io
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/lobehub/sandbox-mcp
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/lobehub-sandbox-mcp:latest
+            ghcr.io/${{ github.repository_owner }}/lobehub-sandbox-mcp:${{ github.sha }}
+          # BuildKit GHA cache — dramatically speeds up repeated Rust/pip builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

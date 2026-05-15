@@ -31,6 +31,7 @@ const homelab = createHomelabContextFromStack(homelabStack);
 // ---------------------------------------------------------------------------
 
 const lobehubImage = cfg.require('lobehubImage');
+const sandboxMcpImage = cfg.require('sandboxMcpImage');
 const appStorageSize = cfg.get('storageSize') ?? '2Gi';
 const dbStorageSize = cfg.get('databaseStorageSize') ?? '10Gi';
 
@@ -205,7 +206,19 @@ const providerEnv = [
 // 5. ExposedWebApp — Deployment, Service, OAuth2-Proxy auth, IngressRoute
 // ---------------------------------------------------------------------------
 
-const appDependsOn: pulumi.Resource[] = [appSecret];
+// Dedicated ServiceAccount with token automount disabled.
+// Neither lobehub nor sandbox-mcp need k8s API access; suppressing the token
+// removes it as a post-exploit pivot point.
+const sa = new k8s.core.v1.ServiceAccount(
+  `${APP_NAME}-sa`,
+  {
+    metadata: { name: APP_NAME, namespace: NAMESPACE },
+    automountServiceAccountToken: false,
+  },
+  { dependsOn: [ns] },
+);
+
+const appDependsOn: pulumi.Resource[] = [appSecret, sa];
 if (db) appDependsOn.push(db);
 
 export const app = homelab.createExposedWebApp(
@@ -219,6 +232,7 @@ export const app = homelab.createExposedWebApp(
     auth: AuthType.OAUTH2_PROXY,
     oauth2Proxy: { group: 'users' }, // LobeHub Better Auth uses same GitHub App => this restricts the user group
     imagePullSecrets: [{ name: 'ghcr-pull-secret' }],
+    serviceAccountName: APP_NAME,
     securityContext: {
       runAsUser: 1001,
       runAsGroup: 1001,
@@ -250,6 +264,52 @@ export const app = homelab.createExposedWebApp(
       mountPath: '/app/data',
     },
     tags: ['lobehub', 'chat', 'ai'],
+    // -----------------------------------------------------------------------
+    // sandbox-mcp sidecar — provides sandboxed code-execution MCP tools.
+    // Accessible at http://localhost:8888/mcp from within the pod (server-side).
+    // Register in LobeHub: Settings → Plugins → Custom Plugin → MCP → URL above.
+    // -----------------------------------------------------------------------
+    extraVolumes: [
+      // Session workspaces live in an emptyDir so the sidecar can use
+      // readOnlyRootFilesystem: true and still write to /tmp/sessions.
+      { name: 'sandbox-sessions', emptyDir: {} },
+    ],
+    extraContainers: [
+      {
+        name: 'sandbox-mcp',
+        image: sandboxMcpImage,
+        imagePullPolicy: 'Always',
+        ports: [{ containerPort: 8888, protocol: 'TCP' }],
+        resources: {
+          requests: { cpu: '50m', memory: '128Mi' },
+          limits: { cpu: '500m', memory: '512Mi' },
+        },
+        securityContext: {
+          runAsNonRoot: true,
+          runAsUser: 1000,
+          allowPrivilegeEscalation: false,
+          readOnlyRootFilesystem: true,
+          seccompProfile: { type: 'RuntimeDefault' },
+          capabilities: { drop: ['ALL'] },
+        },
+        volumeMounts: [
+          { name: 'sandbox-sessions', mountPath: '/tmp/sessions' },
+        ],
+        // TCP probe — FastMCP does not expose a dedicated health endpoint.
+        readinessProbe: {
+          tcpSocket: { port: 8888 },
+          initialDelaySeconds: 15,
+          periodSeconds: 10,
+          failureThreshold: 3,
+        },
+        livenessProbe: {
+          tcpSocket: { port: 8888 },
+          initialDelaySeconds: 30,
+          periodSeconds: 30,
+          failureThreshold: 3,
+        },
+      },
+    ],
   },
   { dependsOn: appDependsOn },
 );
