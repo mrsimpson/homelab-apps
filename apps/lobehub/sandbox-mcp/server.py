@@ -43,6 +43,48 @@ else:
     print(f"sandlock ready: Landlock ABI v{_LANDLOCK_ABI}")
 
 # ---------------------------------------------------------------------------
+# Startup diagnostic: call Sandbox.run() directly from this process to
+# surface the exact do_create error via the new Rust eprintln! logging.
+# The result is discarded — the subprocess workaround handles real calls.
+# ---------------------------------------------------------------------------
+def _diag_direct_sandlock():
+    import os, threading
+    ws = SESSION_BASE / "_diag_"
+    ws.mkdir(parents=True, exist_ok=True)
+    # Capture stderr so the Rust eprintln! output lands in our log
+    r_fd, w_fd = os.pipe()
+    old_stderr = os.dup(2)
+    os.dup2(w_fd, 2)
+    os.close(w_fd)
+    try:
+        sb = Sandbox(
+            fs_readable=["/usr", "/lib", "/etc"],
+            fs_writable=[str(ws)],
+            net_allow=[],
+            max_memory="256M",
+            max_processes=20,
+            clean_env=True,
+            env={"HOME": str(ws), "TMPDIR": str(ws), "PATH": "/usr/local/bin:/usr/bin:/bin"},
+        )
+        result = sb.run(["python3", "-c", "print(1)"], timeout=5.0)
+        diag_ok = result.success
+    except Exception as exc:
+        diag_ok = False
+    finally:
+        os.dup2(old_stderr, 2)
+        os.close(old_stderr)
+        os.set_blocking(r_fd, False)
+        try:
+            rust_stderr = os.read(r_fd, 8192).decode(errors="replace").strip()
+        except BlockingIOError:
+            rust_stderr = ""
+        os.close(r_fd)
+    log.info("diag direct sandlock: pid=%d threads=%d ok=%s rust_stderr=%r",
+             os.getpid(), threading.active_count(), diag_ok, rust_stderr)
+
+_diag_direct_sandlock()
+
+# ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 
