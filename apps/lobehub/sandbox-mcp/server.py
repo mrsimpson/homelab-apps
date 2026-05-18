@@ -2,14 +2,12 @@
 sandbox-mcp: A minimal MCP server exposing sandboxed code execution tools.
 
 Wraps sandlock (Landlock + seccomp) for per-call process isolation.
-Serves Streamable HTTP MCP at POST /mcp on port 8888 (localhost only).
+Serves Streamable HTTP MCP at POST /mcp on port 8888.
 
-Important: all tools that call Sandbox.run() are declared async and
-offload the blocking native call to a thread pool via run_in_executor.
-FastMCP calls sync tools directly on the event loop thread, which causes
-sandlock's fork()-based supervisor to fail (sandlock_spawn returns null
-when called from within a running asyncio event loop). Making tools async
-and using run_in_executor matches the pattern in sandlock's own MCP server.
+sandlock PR#49 (dev branch) fixes sandlock_spawn failure when called from a
+multi-threaded process (uvicorn) under Kubernetes RuntimeDefault seccomp by
+switching FFI entry points to a current-thread Tokio runtime, which spawns no
+worker threads at construction and therefore does not require clone3.
 """
 
 import asyncio
@@ -95,86 +93,29 @@ def _make_policy(ws: pathlib.Path) -> Policy:
 
 
 def _run_sandboxed_sync(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
-    """Execute cmd inside a sandlock sandbox via an isolated helper subprocess.
-
-    Sandlock's native fork()-based supervisor fails when called from a
-    multi-threaded Python process (uvicorn). The workaround: spawn a
-    fresh single-threaded Python helper that calls sandlock and returns
-    the result over a pipe. The helper is isolated from the event loop.
-    """
-    import json as _json
-    import subprocess as _sp
-    import sys as _sys
-
-    # The helper script: receives policy+cmd as JSON on stdin, runs sandlock,
-    # returns {"ok": bool, "output": str, "error": str|null} as JSON on stdout.
-    helper = r"""
-import sys, json, pathlib
-from sandlock import Sandbox, Policy, LandlockUnavailableError
-
-req = json.loads(sys.stdin.read())
-ws = pathlib.Path(req["ws"])
-cmd = req["cmd"]
-timeout = req["timeout"]
-
-readable = ["/usr", "/lib", "/etc"]
-lib64 = pathlib.Path("/lib64")
-if lib64.exists() and not lib64.is_symlink():
-    readable.append("/lib64")
-
-policy = Policy(
-    fs_readable=readable,
-    fs_writable=[str(ws)],
-    net_allow_hosts=[],
-    max_memory="256M",
-    max_processes=20,
-    clean_env=True,
-    env={"HOME": str(ws), "TMPDIR": str(ws), "PATH": "/usr/local/bin:/usr/bin:/bin"},
-)
-
-try:
-    result = Sandbox(policy).run(cmd, timeout=float(timeout))
-    stdout = result.stdout.decode(errors="replace")
-    stderr = result.stderr.decode(errors="replace")
-    output = stdout
-    if stderr:
-        output = output + ("\n" if output else "") + stderr
-    if not result.success:
-        err = getattr(result, "error", None)
-        prefix = f"[exit {result.exit_code}]"
-        if err:
-            prefix += f" {err}"
-        output = prefix + ("\n" + output if output else "")
-    print(json.dumps({"ok": True, "output": output or "(no output)"}))
-except LandlockUnavailableError as e:
-    print(json.dumps({"ok": False, "output": f"[error] Landlock unavailable: {e}"}))
-except Exception as e:
-    print(json.dumps({"ok": False, "output": f"[error] {e}"}))
-"""
-
-    request = _json.dumps({"cmd": cmd, "ws": str(ws), "timeout": timeout})
-    log.info("spawn (via helper): cmd=%s ws=%s", cmd, ws)
+    """Execute cmd inside a sandlock sandbox and return combined output."""
+    policy = _make_policy(ws)
+    log.info("spawn: cmd=%s ws=%s", cmd, ws)
     try:
-        proc = _sp.run(
-            [_sys.executable, "-c", helper],
-            input=request,
-            capture_output=True,
-            text=True,
-            timeout=timeout + 5,
-        )
-        if proc.returncode != 0 and not proc.stdout.strip():
-            log.error("helper stderr: %s", proc.stderr[:500])
-            return f"[error] helper exited {proc.returncode}: {proc.stderr[:200]}"
-        resp = _json.loads(proc.stdout.strip())
-        result_str = resp.get("output", "(no output)")
-        log.info("done: ok=%s output=%r", resp.get("ok"), result_str[:80])
-        return result_str
-    except _sp.TimeoutExpired:
-        log.error("helper timed out after %ss", timeout + 5)
-        return f"[error] execution timed out after {timeout}s"
-    except Exception as exc:
-        log.exception("helper invocation failed: cmd=%s", cmd)
-        return f"[error] {exc}"
+        result = Sandbox(policy).run(cmd, timeout=float(timeout))
+        stdout = result.stdout.decode(errors="replace")
+        stderr = result.stderr.decode(errors="replace")
+        output = stdout
+        if stderr:
+            output = output + ("\n" if output else "") + stderr
+        if not result.success:
+            err = getattr(result, "error", None)
+            prefix = f"[exit {result.exit_code}]"
+            if err:
+                prefix += f" {err}"
+            output = prefix + ("\n" + output if output else "")
+        log.info("done: exit=%s output=%r", result.exit_code, (output or "")[:80])
+        return output or "(no output)"
+    except LandlockUnavailableError as e:
+        return f"[error] Landlock unavailable: {e}"
+    except Exception as e:
+        log.exception("sandbox run failed: cmd=%s", cmd)
+        return f"[error] {e}"
 
 
 async def _run_sandboxed(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
@@ -326,208 +267,10 @@ def list_files(path: str = ".", session_id: str = "default") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Debug middleware + spawn test endpoint
-#
-# Logs the raw JSON body of every incoming MCP POST (truncated to 2 KB so
-# we can see exactly what LobeHub sends without drowning the logs).
-# Also exposes GET /debug/spawn — curl it from inside the pod to trigger
-# a sandlock spawn from within the running server process and see if it works.
-# ---------------------------------------------------------------------------
-
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
-from starlette.responses import JSONResponse
-from starlette.routing import Route
-
-
-class _LogBodyMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: StarletteRequest, call_next):
-        if request.method == "POST" and request.url.path == "/mcp":
-            try:
-                body = await request.body()
-                log.info("MCP POST body (%d bytes): %s", len(body), body[:2048].decode(errors="replace"))
-            except Exception:
-                pass
-        return await call_next(request)
-
-
-def _debug_spawn_sync() -> dict:
-    """Run sandlock spawn synchronously — call from run_in_executor."""
-    import os, ctypes, ctypes.util, threading
-    from sandlock import Sandbox, Policy
-    from sandlock._sdk import _lib, _NativePolicy, _make_argv
-
-    info = {
-        "pid": os.getpid(),
-        "tid": threading.get_ident(),
-        "active_threads": threading.active_count(),
-    }
-
-    # Read seccomp filter count for this thread
-    try:
-        with open(f"/proc/self/status") as f:
-            for line in f:
-                if "Seccomp" in line:
-                    info["seccomp"] = line.strip()
-    except Exception as e:
-        info["seccomp_err"] = str(e)
-
-    ws = _session_workspace("__debug__")
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", dir=ws, delete=False, prefix="_dbg_") as f:
-        f.write("print('debug spawn ok')\n")
-        sp = f.name
-
-    try:
-        # Test 1: minimal policy (no net restriction)
-        p_min = Policy(
-            fs_readable=["/usr", "/lib", "/etc"],
-            fs_writable=[str(ws)],
-            clean_env=True,
-            env={"HOME": str(ws), "TMPDIR": str(ws), "PATH": "/usr/local/bin:/usr/bin:/bin"},
-        )
-        r_min = Sandbox(p_min).run(["python3", sp], timeout=5.0)
-        info["minimal_policy"] = {"ok": r_min.success, "error": getattr(r_min, "error", None)}
-
-        # Test 2: full policy as used by tools
-        p_full = _make_policy(ws)
-        r_full = Sandbox(p_full).run(["python3", sp], timeout=5.0)
-        info["full_policy"] = {"ok": r_full.success, "error": getattr(r_full, "error", None)}
-
-        # Test 3: raw fork()
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        pid = os.fork()
-        if pid == 0:
-            os._exit(0)
-        os.waitpid(pid, 0)
-        info["fork"] = "ok"
-
-        # Test 4: epoll_create1 (used by Tokio runtime)
-        import ctypes.util as _cu
-        _libc = ctypes.CDLL(_cu.find_library("c"), use_errno=True)
-        efd = _libc.epoll_create1(0)
-        errno_ = ctypes.get_errno()
-        info["epoll_create1"] = f"fd={efd} errno={errno_}"
-        if efd >= 0:
-            _libc.close(efd)
-
-        # Test 5: clone with CLONE_THREAD (what Tokio uses for worker threads)
-        CLONE_THREAD = 0x00010000
-        CLONE_VM     = 0x00000100
-        CLONE_SIGHAND= 0x00000800
-        CLONE_FS     = 0x00000200
-        CLONE_FILES  = 0x00000400
-        CLONE_SYSVSEM= 0x00040000
-        CLONE_SETTLS = 0x00080000
-        CLONE_PARENT_SETTID = 0x00100000
-        CLONE_CHILD_CLEARTID = 0x00200000
-        # Don't actually try clone(CLONE_THREAD) - it's too complex without proper TLS setup
-        # Instead check if CLONE_NEWUSER is available (sandlock may try this)
-        CLONE_NEWUSER = 0x10000000
-        ret = _libc.unshare(CLONE_NEWUSER)
-        errno_ = ctypes.get_errno()
-        info["unshare_newuser"] = f"ret={ret} errno={errno_}"
-
-        # Test 6: check /proc/sys/user/max_user_namespaces
-        try:
-            max_ns = pathlib.Path("/proc/sys/user/max_user_namespaces").read_text().strip()
-            info["max_user_namespaces"] = max_ns
-        except Exception as e:
-            info["max_user_namespaces"] = f"error: {e}"
-
-        # Test 7: check if prctl(PR_SET_SECCOMP) is blocked
-        PR_SET_SECCOMP = 22
-        SECCOMP_MODE_STRICT = 1
-        # Don't actually set strict mode, just test another prctl
-        PR_GET_SECCOMP = 21
-        ret = _libc.prctl(PR_GET_SECCOMP, 0, 0, 0, 0)
-        errno_ = ctypes.get_errno()
-        info["prctl_get_seccomp"] = f"ret={ret} errno={errno_}"
-
-        # Test 8: fork + check child's /proc/self/fd count
-        pipe_r, pipe_w = os.pipe()
-        pid2 = os.fork()
-        if pid2 == 0:
-            os.close(pipe_r)
-            import pathlib as _pl
-            fds = list(_pl.Path('/proc/self/fd').iterdir())
-            msg = f"child fds={len(fds)}".encode()
-            os.write(pipe_w, msg)
-            os.close(pipe_w)
-            os._exit(0)
-        os.close(pipe_w)
-        child_info = os.read(pipe_r, 256).decode()
-        os.close(pipe_r)
-        os.waitpid(pid2, 0)
-        info["fork_child_fd_count"] = child_info
-
-        # Test 9: clone3 availability (what Tokio uses for thread spawning)
-        SYS_clone3 = 435
-        SIGCHLD = 17
-        class _ca(ctypes.Structure):
-            _fields_ = [('flags',ctypes.c_uint64),('pidfd',ctypes.c_uint64),('child_tid',ctypes.c_uint64),('parent_tid',ctypes.c_uint64),('exit_signal',ctypes.c_uint64),('stack',ctypes.c_uint64),('stack_size',ctypes.c_uint64),('tls',ctypes.c_uint64),('set_tid',ctypes.c_uint64),('set_tid_size',ctypes.c_uint64),('cgroup',ctypes.c_uint64)]
-        _args = _ca(); _args.flags = 0; _args.exit_signal = SIGCHLD
-        ret3 = _libc.syscall(SYS_clone3, ctypes.byref(_args), ctypes.sizeof(_args))
-        _e3 = ctypes.get_errno()
-        if ret3 == 0: os._exit(0)
-        elif ret3 > 0: os.waitpid(ret3, 0)
-        info["clone3"] = f"ret={ret3} errno={_e3} ({os.strerror(_e3)})"
-
-        # Test 10: try spawning a real OS thread via ctypes (like Tokio does)
-        import threading as _thr
-        _thr_result = []
-        def _t():
-            _thr_result.append(threading.get_ident())
-        _tt = _thr.Thread(target=_t)
-        _tt.start(); _tt.join(timeout=5)
-        info["new_thread"] = f"ok tid={_thr_result[0]}" if _thr_result else "TIMEOUT"
-
-    except Exception as exc:
-        info["exception"] = str(exc)
-    finally:
-        pathlib.Path(sp).unlink(missing_ok=True)
-
-    return info
-
-
-async def _debug_spawn(request: StarletteRequest):
-    """Trigger sandlock spawn tests from within the server process."""
-    loop = asyncio.get_event_loop()
-    info = await loop.run_in_executor(None, _debug_spawn_sync)
-    log.info("debug_spawn result: %s", info)
-    return JSONResponse(info)
-
-
-# ---------------------------------------------------------------------------
-# Entry point — mount middleware and debug route onto the FastMCP ASGI app
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    from starlette.applications import Starlette
-
-    # Get the underlying ASGI app from FastMCP and wrap it
-    _fastmcp_app = mcp.streamable_http_app()
-    _app = Starlette(
-        routes=[
-            Route("/debug/spawn", _debug_spawn, methods=["GET"]),
-        ],
-    )
-
-    # Chain: debug routes first, then MCP app for everything else
-    from starlette.middleware.base import BaseHTTPMiddleware as _BM
-
-    class _Router:
-        def __init__(self):
-            self._debug = _app
-            self._mcp = _fastmcp_app
-
-        async def __call__(self, scope, receive, send):
-            if scope["type"] == "http" and scope["path"].startswith("/debug/"):
-                await self._debug(scope, receive, send)
-            else:
-                await self._mcp(scope, receive, send)
-
-    _router = _Router()
-    _wrapped = _LogBodyMiddleware(_router)
-
-    uvicorn.run(_wrapped, host="0.0.0.0", port=8888)
+    app = mcp.streamable_http_app()
+    uvicorn.run(app, host="0.0.0.0", port=8888)

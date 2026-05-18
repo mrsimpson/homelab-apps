@@ -7,10 +7,11 @@
 
 FROM python:3.12-slim AS builder
 
-# Build dependencies for sandlock (Rust FFI compiled via maturin) and mcp SDK
+# Build dependencies for sandlock (Rust FFI compiled via setuptools_rust) and mcp SDK
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gcc \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust toolchain (required to compile sandlock's native Rust extension)
@@ -20,10 +21,14 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal
 
-# Install Python packages into /install for clean copy to final image
-# Note: sandlock ships pre-built manylinux wheels for x86_64 — Rust is only
-# needed if the wheel is unavailable and the sdist must be compiled.
-RUN pip install --no-cache-dir --prefix=/install sandlock "mcp[cli]"
+# Clone sandlock at the PR#49 dev branch (fixes sandlock_spawn failure from
+# multi-threaded callers under RuntimeDefault seccomp; see issue #47).
+# Once merged and released we can switch back to: pip install sandlock
+RUN git clone --depth 1 --branch dev https://github.com/multikernel/sandlock /build/sandlock
+
+# Build and install sandlock from source, then install the mcp SDK
+RUN pip install --no-cache-dir setuptools setuptools_rust \
+    && pip install --no-cache-dir --prefix=/install /build/sandlock/python "mcp[cli]"
 
 # ---------------------------------------------------------------------------
 # Final image — copy compiled packages only, no build tools
