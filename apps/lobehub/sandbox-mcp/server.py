@@ -47,6 +47,34 @@ else:
 
 mcp = FastMCP("sandbox-mcp", host="0.0.0.0", port=8888)
 
+# Patch sandlock_create_for_run to log when it returns NULL so we can
+# capture the exact thread/seccomp state at the moment of failure.
+def _patch_sandlock_ffi():
+    try:
+        from sandlock._sdk import _lib
+        _orig = _lib.sandlock_create_for_run
+        def _traced(*args):
+            handle = _orig(*args)
+            if not handle:
+                import threading, os
+                try:
+                    status = open("/proc/self/status").read()
+                    threads_line = next((l for l in status.splitlines() if "Threads" in l), "?")
+                    seccomp_line = next((l for l in status.splitlines() if "Seccomp" in l), "?")
+                except Exception:
+                    threads_line = seccomp_line = "unavailable"
+                log.error("sandlock_create_for_run returned NULL: "
+                          "active_threads=%d pid=%d %s %s",
+                          threading.active_count(), os.getpid(),
+                          threads_line, seccomp_line)
+            return handle
+        _lib.sandlock_create_for_run = _traced
+        log.info("sandlock FFI patched for diagnostics")
+    except Exception as e:
+        log.warning("could not patch sandlock FFI: %s", e)
+
+_patch_sandlock_ffi()
+
 
 def _session_workspace(session_id: str) -> pathlib.Path:
     """Return (and create) the workspace directory for a given session."""
@@ -94,8 +122,10 @@ def _make_sandbox(ws: pathlib.Path) -> Sandbox:
 
 def _run_sandboxed_sync(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
     """Execute cmd inside a sandlock sandbox and return combined output."""
+    import threading as _thr, os as _os
     sandbox = _make_sandbox(ws)
-    log.info("spawn: cmd=%s ws=%s", cmd, ws)
+    log.info("spawn: cmd=%s ws=%s threads=%d pid=%d",
+             cmd, ws, _thr.active_count(), _os.getpid())
     try:
         result = sandbox.run(cmd, timeout=float(timeout))
         stdout = result.stdout.decode(errors="replace")
@@ -109,6 +139,8 @@ def _run_sandboxed_sync(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> 
             if err:
                 prefix += f" {err}"
             output = prefix + ("\n" + output if output else "")
+            log.warning("sandbox failed: exit=%s error=%s stdout=%r stderr=%r",
+                        result.exit_code, err, result.stdout[:200], result.stderr[:200])
         log.info("done: exit=%s output=%r", result.exit_code, (output or "")[:80])
         return output or "(no output)"
     except LandlockUnavailableError as e:
