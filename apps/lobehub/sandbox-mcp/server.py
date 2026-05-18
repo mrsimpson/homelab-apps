@@ -3,12 +3,6 @@ sandbox-mcp: A minimal MCP server exposing sandboxed code execution tools.
 
 Wraps sandlock (Landlock + seccomp) for per-call process isolation.
 Serves Streamable HTTP MCP at POST /mcp on port 8888.
-
-sandlock's Sandbox.run() fails when called from within the uvicorn server
-process (PID 1) under Kubernetes RuntimeDefault seccomp. The root cause is
-still under investigation (see multikernel/sandlock#47). As a workaround,
-each sandbox invocation is dispatched to a fresh single-threaded helper
-subprocess where sandlock works correctly.
 """
 
 import asyncio
@@ -43,48 +37,6 @@ else:
     print(f"sandlock ready: Landlock ABI v{_LANDLOCK_ABI}")
 
 # ---------------------------------------------------------------------------
-# Startup diagnostic: call Sandbox.run() directly from this process to
-# surface the exact do_create error via the new Rust eprintln! logging.
-# The result is discarded — the subprocess workaround handles real calls.
-# ---------------------------------------------------------------------------
-def _diag_direct_sandlock():
-    import os, threading
-    ws = SESSION_BASE / "_diag_"
-    ws.mkdir(parents=True, exist_ok=True)
-    # Capture stderr so the Rust eprintln! output lands in our log
-    r_fd, w_fd = os.pipe()
-    old_stderr = os.dup(2)
-    os.dup2(w_fd, 2)
-    os.close(w_fd)
-    try:
-        sb = Sandbox(
-            fs_readable=["/usr", "/lib", "/etc"],
-            fs_writable=[str(ws)],
-            net_allow=[],
-            max_memory="256M",
-            max_processes=20,
-            clean_env=True,
-            env={"HOME": str(ws), "TMPDIR": str(ws), "PATH": "/usr/local/bin:/usr/bin:/bin"},
-        )
-        result = sb.run(["python3", "-c", "print(1)"], timeout=5.0)
-        diag_ok = result.success
-    except Exception as exc:
-        diag_ok = False
-    finally:
-        os.dup2(old_stderr, 2)
-        os.close(old_stderr)
-        os.set_blocking(r_fd, False)
-        try:
-            rust_stderr = os.read(r_fd, 8192).decode(errors="replace").strip()
-        except BlockingIOError:
-            rust_stderr = ""
-        os.close(r_fd)
-    log.info("diag direct sandlock: pid=%d threads=%d ok=%s rust_stderr=%r",
-             os.getpid(), threading.active_count(), diag_ok, rust_stderr)
-
-_diag_direct_sandlock()
-
-# ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 
@@ -108,85 +60,48 @@ def _resolve_safe(ws: pathlib.Path, path: str) -> pathlib.Path | None:
         return None
 
 
+def _make_sandbox(ws: pathlib.Path) -> Sandbox:
+    """Build a deny-by-default Sandbox for one execution."""
+    readable = ["/usr", "/lib", "/etc"]
+    lib64 = pathlib.Path("/lib64")
+    if lib64.exists() and not lib64.is_symlink():
+        readable.append("/lib64")
+
+    return Sandbox(
+        fs_readable=readable,
+        fs_writable=[str(ws)],
+        net_allow=[],
+        max_memory="256M",
+        max_processes=20,
+        clean_env=True,
+        env={"HOME": str(ws), "TMPDIR": str(ws), "PATH": "/usr/local/bin:/usr/bin:/bin"},
+    )
+
+
 def _run_sandboxed_sync(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
-    """Execute cmd inside a sandlock sandbox via an isolated helper subprocess.
-
-    Sandlock's Sandbox.run() fails when called from the uvicorn server process
-    (PID 1, multi-threaded, under Kubernetes RuntimeDefault seccomp). The
-    workaround: spawn a fresh single-threaded Python helper that calls sandlock
-    and returns the result over a pipe.
-    """
-    import json as _json
-    import subprocess as _sp
-    import sys as _sys
-
-    helper = r"""
-import sys, json, pathlib
-from sandlock import Sandbox, LandlockUnavailableError
-
-req = json.loads(sys.stdin.read())
-ws = pathlib.Path(req["ws"])
-cmd = req["cmd"]
-timeout = req["timeout"]
-
-readable = ["/usr", "/lib", "/etc"]
-lib64 = pathlib.Path("/lib64")
-if lib64.exists() and not lib64.is_symlink():
-    readable.append("/lib64")
-
-sb = Sandbox(
-    fs_readable=readable,
-    fs_writable=[str(ws)],
-    net_allow=[],
-    max_memory="256M",
-    max_processes=20,
-    clean_env=True,
-    env={"HOME": str(ws), "TMPDIR": str(ws), "PATH": "/usr/local/bin:/usr/bin:/bin"},
-)
-
-try:
-    result = sb.run(cmd, timeout=float(timeout))
-    stdout = result.stdout.decode(errors="replace")
-    stderr = result.stderr.decode(errors="replace")
-    output = stdout
-    if stderr:
-        output = output + ("\n" if output else "") + stderr
-    if not result.success:
-        err = getattr(result, "error", None)
-        prefix = f"[exit {result.exit_code}]"
-        if err:
-            prefix += f" {err}"
-        output = prefix + ("\n" + output if output else "")
-    print(json.dumps({"ok": True, "output": output or "(no output)"}))
-except LandlockUnavailableError as e:
-    print(json.dumps({"ok": False, "output": f"[error] Landlock unavailable: {e}"}))
-except Exception as e:
-    print(json.dumps({"ok": False, "output": f"[error] {e}"}))
-"""
-
-    request = _json.dumps({"cmd": cmd, "ws": str(ws), "timeout": timeout})
-    log.info("spawn (via helper): cmd=%s ws=%s", cmd, ws)
+    """Execute cmd inside a sandlock sandbox and return combined output."""
+    sandbox = _make_sandbox(ws)
+    log.info("spawn: cmd=%s ws=%s", cmd, ws)
     try:
-        proc = _sp.run(
-            [_sys.executable, "-c", helper],
-            input=request,
-            capture_output=True,
-            text=True,
-            timeout=timeout + 5,
-        )
-        if proc.returncode != 0 and not proc.stdout.strip():
-            log.error("helper stderr: %s", proc.stderr[:500])
-            return f"[error] helper exited {proc.returncode}: {proc.stderr[:200]}"
-        resp = _json.loads(proc.stdout.strip())
-        result_str = resp.get("output", "(no output)")
-        log.info("done: ok=%s output=%r", resp.get("ok"), result_str[:80])
-        return result_str
-    except _sp.TimeoutExpired:
-        log.error("helper timed out after %ss", timeout + 5)
-        return f"[error] execution timed out after {timeout}s"
-    except Exception as exc:
-        log.exception("helper invocation failed: cmd=%s", cmd)
-        return f"[error] {exc}"
+        result = sandbox.run(cmd, timeout=float(timeout))
+        stdout = result.stdout.decode(errors="replace")
+        stderr = result.stderr.decode(errors="replace")
+        output = stdout
+        if stderr:
+            output = output + ("\n" if output else "") + stderr
+        if not result.success:
+            err = getattr(result, "error", None)
+            prefix = f"[exit {result.exit_code}]"
+            if err:
+                prefix += f" {err}"
+            output = prefix + ("\n" + output if output else "")
+        log.info("done: exit=%s output=%r", result.exit_code, (output or "")[:80])
+        return output or "(no output)"
+    except LandlockUnavailableError as e:
+        return f"[error] Landlock unavailable: {e}"
+    except Exception as e:
+        log.exception("sandbox run failed: cmd=%s", cmd)
+        return f"[error] {e}"
 
 
 async def _run_sandboxed(cmd: list[str], ws: pathlib.Path, timeout: int = 30) -> str:
@@ -198,8 +113,7 @@ async def _run_sandboxed(cmd: list[str], ws: pathlib.Path, timeout: int = 30) ->
 
 
 # ---------------------------------------------------------------------------
-# Tools — all async so FastMCP dispatches them correctly and we can
-# await run_in_executor for the blocking subprocess call.
+# Tools — all async for correct FastMCP dispatch + run_in_executor.
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
