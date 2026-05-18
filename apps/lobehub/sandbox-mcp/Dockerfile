@@ -22,11 +22,11 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal
 
-# Building from a fork branch that adds error logging to surface the exact
-# do_create failure seen from uvicorn under Kubernetes RuntimeDefault seccomp.
-# See: https://github.com/multikernel/sandlock/pull/49
+# Building from a fork branch that fixes the getppid()==1 false positive
+# in containers (see https://github.com/multikernel/sandlock/pull/49).
 # TODO: switch back to `pip install sandlock` once upstream fix is confirmed.
-RUN git clone --depth 1 --branch diag/log-do-create-error https://github.com/mrsimpson/sandlock /build/sandlock
+RUN git clone --depth 1 --branch diag/log-do-create-error https://github.com/mrsimpson/sandlock /build/sandlock \
+    && git -C /build/sandlock log --oneline -1
 
 # Build and install sandlock from source, then install the mcp SDK
 RUN pip install --no-cache-dir setuptools setuptools_rust \
